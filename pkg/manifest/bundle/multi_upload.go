@@ -115,31 +115,40 @@ func verifyAndUploadExactManifests(ctx context.Context, root ExactManifest, depe
 			clear(keys)
 			return err
 		}
-		for index, entry := range manifest.Entries {
-			if entry.IsZero {
-				continue
-			}
-			chunkKey := store.ContentKey(entry.CiphertextHash)
-			reference := chunkReference{decryptKey: keys[index], plainSize: entry.Size}
-			if previous, ok := globalRefs[chunkKey]; ok && previous != reference {
-				clear(keys)
-				clear(reference.decryptKey[:])
-				return fmt.Errorf("manifest bundle: Chunk %s has inconsistent key or plaintext size across selected Manifests", hex.EncodeToString(chunkKey[:]))
+		err = manifestChunkRefs(manifest, keys, func(chunkKey store.ContentKey, reference chunkReference) error {
+			if previous, ok := globalRefs[chunkKey]; ok {
+				merged, err := mergeChunkReference(chunkKey, previous, reference)
+				if err != nil {
+					return fmt.Errorf("%w (across selected Manifests)", err)
+				}
+				reference = merged
 			}
 			globalRefs[chunkKey] = reference
 			chunk := exactChunk{reader: selected.Reader, key: chunkKey}
 			if previous, ok := chunkRefs[chunk]; ok {
-				if previous != reference {
-					clear(keys)
-					clear(reference.decryptKey[:])
-					return fmt.Errorf("manifest bundle: Chunk %s has inconsistent metadata in one selected Bundle", hex.EncodeToString(chunkKey[:]))
+				merged, err := mergeChunkReference(chunkKey, previous, reference)
+				if err != nil {
+					return fmt.Errorf("%w (in one selected Bundle)", err)
 				}
-				continue
+				chunkRefs[chunk] = merged
+				return nil
 			}
 			chunkRefs[chunk] = reference
 			chunkOrder = append(chunkOrder, chunk)
-		}
+			return nil
+		})
 		clear(keys)
+		if err != nil {
+			return err
+		}
+	}
+	// A base-only reference in one Bundle may have been upgraded to an entry
+	// reference (with its key) by a later selected Manifest: verify with the
+	// most informed reference for the object.
+	for chunk, reference := range chunkRefs {
+		if global, ok := globalRefs[chunk.key]; ok && reference.kind == refBase && global.kind != refBase {
+			chunkRefs[chunk] = global
+		}
 	}
 
 	if err := verifyExactChunks(ctx, chunkOrder, chunkRefs, decryptor, target, opts); err != nil {
@@ -265,10 +274,17 @@ func verifyExactChunks(ctx context.Context, chunks []exactChunk, refs map[exactC
 					continue
 				}
 				physical := blob.Bytes()
-				if err := decryptor.DecryptChunkTo(workCtx, reference.decryptKey, physical, plain); err != nil {
+				getBase := func(ctx context.Context, key store.ContentKey) ([]byte, func(), error) {
+					b, err := getVerified(ctx, chunk.reader.Getter(), store.PartitionChunk, key)
+					if err != nil {
+						return nil, nil, err
+					}
+					return b.Bytes(), b.Release, nil
+				}
+				if err := verifyChunkPlaintext(workCtx, decryptor, chunk.key, reference, physical, plain, getBase); err != nil {
 					blob.Release()
 					clear(plain)
-					fail(fmt.Errorf("manifest bundle: Chunk %s decrypt/decompress: %w", hex.EncodeToString(chunk.key[:]), err))
+					fail(err)
 					continue
 				}
 				admission := chunk.reader.Admission()
