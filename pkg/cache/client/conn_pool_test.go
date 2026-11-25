@@ -140,3 +140,48 @@ func TestSetOpDeadlineClearsStaleDeadlineWithoutBudget(t *testing.T) {
 		t.Fatal("server did not observe the request in time")
 	}
 }
+
+func TestTakeNewestRelaysWakeupWhileIdleConnectionsRemain(t *testing.T) {
+	p := &ConnPool{
+		free:    newConnDeque(3),
+		changed: make(chan struct{}, 1),
+	}
+	oldest, newest := &PoolConn{}, &PoolConn{}
+	p.free.pushBack(oldest)
+	p.free.pushBack(newest)
+
+	if got := p.takeNewest(); got != newest {
+		t.Fatalf("taken connection = %p, want newest %p", got, newest)
+	}
+	select {
+	case <-p.changed:
+	default:
+		t.Fatal("remaining idle connection did not wake another waiter")
+	}
+	if got := p.takeNewest(); got != oldest {
+		t.Fatalf("remaining connection = %p, want oldest %p", got, oldest)
+	}
+}
+
+func TestConnPoolUsesNewestForAcquireAndOldestForMaintenance(t *testing.T) {
+	p := &ConnPool{
+		free:    newConnDeque(3),
+		changed: make(chan struct{}, 1),
+	}
+	oldest, middle, newest := &PoolConn{}, &PoolConn{}, &PoolConn{}
+	for _, pc := range []*PoolConn{oldest, middle, newest} {
+		if !p.free.pushBack(pc) {
+			t.Fatal("push into available capacity failed")
+		}
+	}
+
+	if got := p.takeNewest(); got != newest {
+		t.Fatalf("Acquire selected %p, want newest %p", got, newest)
+	}
+	if got := p.popOldest(); got != oldest {
+		t.Fatalf("maintenance selected %p, want oldest %p", got, oldest)
+	}
+	if got := p.takeNewest(); got != middle {
+		t.Fatalf("remaining Acquire selected %p, want %p", got, middle)
+	}
+}
