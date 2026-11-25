@@ -3,6 +3,7 @@ package bundle
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
@@ -29,7 +30,111 @@ import (
 //     key, checking that it names the base the manifest said it does, decrypting
 //     that base with the key the delta carries, and applying the stream. The
 //     base's bytes are hash-checked like every other object. Depth is one: a
-//     base that is itself a delta object is rejected.
+//     base that is itself a delta object is rejected;
+//   - uploading a delta object also records the Store alias that names it as
+//     the chunk's representation. A manifest may reference a delta object only
+//     if the alias names it, and store-ctl delta-gc deletes delta objects no
+//     alias names. If the alias cannot be recorded for this object, the upload
+//     fails before any Manifest is published.
+
+// DeltaAliasStore is the ExactStore capability required to upload a Bundle that
+// contains delta objects. See store.PutResult.
+type DeltaAliasStore interface {
+	PutRepresenting(ctx context.Context, admission store.WriteAdmission, key store.ContentKey, data []byte, represents store.ContentKey) (store.PutResult, error)
+}
+
+// ErrDeltaAlias reports that a delta object cannot be uploaded because its
+// Store alias cannot be recorded. No Manifest has been published.
+var ErrDeltaAlias = errors.New("manifest bundle: cannot record the Store alias for a delta object")
+
+// checkDeltaUpload fails before any Put when the upload includes a delta object
+// and either the target cannot record aliases or the decryptor cannot encrypt,
+// which computing a delta chunk's independent address requires.
+func checkDeltaUpload(target ExactStore, decryptor manifestcrypto.Decryptor, hasDelta bool) error {
+	if target == nil || !hasDelta {
+		return nil
+	}
+	if _, ok := target.(DeltaAliasStore); !ok {
+		return fmt.Errorf("%w: the upload target cannot record aliases", ErrDeltaAlias)
+	}
+	if _, ok := decryptor.(manifestcrypto.Encryptor); !ok {
+		return fmt.Errorf("%w: the decryptor cannot encrypt, which computing a chunk's independent address requires", ErrDeltaAlias)
+	}
+	return nil
+}
+
+// deltaIndependentKey returns H_ind, the address the delta chunk's plaintext
+// would have as an independent object under admission's salt, which names the
+// chunk's alias. plain is the verified plaintext. The delta key in the manifest
+// is re-derived under the same salt first: a manifest written with a writer
+// extra salt does not match, and its H_ind cannot be computed here.
+func deltaIndependentKey(ctx context.Context, decryptor manifestcrypto.Decryptor, admission store.WriteAdmission, key store.ContentKey, reference chunkReference, physical, plain []byte) (store.ContentKey, error) {
+	hdr, err := manifestcrypto.ParseDeltaHeader(physical)
+	if err != nil {
+		return store.ContentKey{}, fmt.Errorf("manifest bundle: Chunk %s: %w", hex.EncodeToString(key[:]), err)
+	}
+	if manifestcrypto.DeriveDeltaKey(admission.Salt, hdr.BaseObjectKey, plain) != reference.decryptKey {
+		return store.ContentKey{}, fmt.Errorf("%w: Chunk %s was written under a writer extra salt, so its independent address is unknown",
+			ErrDeltaAlias, hex.EncodeToString(key[:]))
+	}
+	enc, ok := decryptor.(manifestcrypto.Encryptor)
+	if !ok {
+		return store.ContentKey{}, fmt.Errorf("%w: the decryptor cannot encrypt", ErrDeltaAlias)
+	}
+	object, hInd, chunkKey, err := enc.EncryptChunk(ctx, admission.Salt, plain)
+	clear(object)
+	clear(chunkKey[:])
+	if err != nil {
+		return store.ContentKey{}, fmt.Errorf("manifest bundle: Chunk %s independent address: %w", hex.EncodeToString(key[:]), err)
+	}
+	return store.ContentKey(hInd), nil
+}
+
+// recordDeltaAlias records key as the representation of the chunk at hInd. The
+// object must already be stored: a representing Put of an existing object never
+// deletes it, whatever the outcome. Only a recorded or existing alias naming key
+// is success.
+func recordDeltaAlias(ctx context.Context, target ExactStore, admission store.WriteAdmission, key, hInd store.ContentKey, physical []byte) error {
+	aliases, ok := target.(DeltaAliasStore)
+	if !ok {
+		return fmt.Errorf("%w: the upload target cannot record aliases", ErrDeltaAlias)
+	}
+	res, err := aliases.PutRepresenting(ctx, admission, key, physical, hInd)
+	if err != nil {
+		return fmt.Errorf("manifest bundle: record alias for Chunk %s: %w", hex.EncodeToString(key[:]), err)
+	}
+	switch {
+	case res.Discarded:
+		return fmt.Errorf("%w: the Store deleted Chunk %s after a lost alias", ErrDeltaAlias, hex.EncodeToString(key[:]))
+	case res.Represented == store.RepresentedWon:
+		return nil
+	case res.Represented == store.RepresentedLost:
+		return fmt.Errorf("%w: the target already represents chunk %s by another delta object %s",
+			ErrDeltaAlias, hex.EncodeToString(hInd[:]), hex.EncodeToString(res.Key[:]))
+	default:
+		return fmt.Errorf("%w: the Store did not record an alias for Chunk %s (%v); it may predate delta aliases",
+			ErrDeltaAlias, hex.EncodeToString(key[:]), res.Represented)
+	}
+}
+
+// uploadChunk stores one verified chunk object on target, and records the alias
+// for a delta object.
+func uploadChunk(ctx context.Context, target ExactStore, decryptor manifestcrypto.Decryptor, admission store.WriteAdmission, key store.ContentKey, reference chunkReference, physical, plain []byte) error {
+	var hInd store.ContentKey
+	if reference.kind == refDelta {
+		var err error
+		if hInd, err = deltaIndependentKey(ctx, decryptor, admission, key, reference, physical, plain); err != nil {
+			return err
+		}
+	}
+	if _, err := target.Put(ctx, admission, store.PartitionChunk, key, physical); err != nil {
+		return fmt.Errorf("manifest bundle: upload Chunk %s: %w", hex.EncodeToString(key[:]), err)
+	}
+	if reference.kind == refDelta {
+		return recordDeltaAlias(ctx, target, admission, key, hInd, physical)
+	}
+	return nil
+}
 
 // refKind says how a manifest references a chunk object.
 type refKind uint8

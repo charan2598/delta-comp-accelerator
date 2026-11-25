@@ -3,11 +3,9 @@ package delta
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -19,38 +17,32 @@ import (
 // similarity index. The base pool is not persisted. After a restart a base is
 // usable again once its object is read back from the store.
 //
-// File layout (little endian), version 3:
+// File layout (little endian):
 //
-//	"KDLTSNP1"  version u32  fileID [16]
+//	"KDLTSNP1"  version u32 (= snapVersion)  fileID [16]
 //	sealed (see seal.go):
 //	  params fingerprint [32]  ndomains u32
 //	  per domain: salt [32] | bloom count u64 | bloom words u64[] |
-//	              nrep u64 | nrep * (hInd[32] deltaKey[32] baseKey[32] size u32)
+//	              nrep u64 | nrep * (hInd[32] deltaKey[32] baseKey[32] size u32 baseSize u32)
 //	              nbases u64 | bases (objectKey[32] K_B[32] size u32 sketch...)
 //
 // The body is sealed because the base records carry K_B, the convergent key
-// that decrypts each base chunk. Versions 1 and 2 wrote the same body in the
-// clear with a trailing SHA-256 and still load, so a node upgraded in place
-// keeps its state; the next snapshot it writes is sealed.
-//
-// A file is trusted only if every frame authenticates (or, for the old
-// versions, the trailing checksum matches) AND the parameter fingerprint
+// that decrypts each base chunk. A file is trusted only if its version is
+// snapVersion, every frame authenticates, and the parameter fingerprint
 // equals the running one; otherwise it is discarded whole. It is written to a
 // temp file and renamed, so a crash leaves the previous snapshot.
 const (
 	snapMagic   = "KDLTSNP1"
-	snapVersion = 3 // 3 seals the body and adds BaseSize to rep records; 2 added the similarity index; 1 (reps + bloom) still loads
-	snapSealed  = 3 // first version whose body is sealed
+	snapVersion = 3
 
-	repRecordLen   = 104 // hInd ‖ deltaObjectKey ‖ baseObjectKey ‖ objectSize u32 ‖ baseSize u32
-	repRecordLenV2 = 100 // versions 1 and 2: without baseSize
+	repRecordLen = 104 // hInd ‖ deltaObjectKey ‖ baseObjectKey ‖ objectSize u32 ‖ baseSize u32
 )
 
 // ErrSnapshotMismatch means the file is intact but was written under different
 // sketch parameters, so its entries would be misread.
 var ErrSnapshotMismatch = errors.New("delta: snapshot parameters differ from running configuration")
 
-// ErrSnapshotCorrupt means the file failed structural or checksum validation.
+// ErrSnapshotCorrupt means the file failed structural or authentication checks.
 var ErrSnapshotCorrupt = errors.New("delta: snapshot is corrupt")
 
 // Snapshot writes the current state. It is a no-op without a configured path.
@@ -136,7 +128,7 @@ func (e *Engine) snapshotLocked() error {
 	if err != nil {
 		return fail(err)
 	}
-	if err := writeSnapshotBody(sw, e.p.Fingerprint(), doms, snapVersion); err != nil {
+	if err := writeSnapshotBody(sw, e.p.Fingerprint(), doms); err != nil {
 		return fail(err)
 	}
 	if err := sw.Close(); err != nil {
@@ -163,14 +155,9 @@ func (e *Engine) snapshotLocked() error {
 }
 
 // writeSnapshotBody writes everything after the header: the fingerprint and
-// the per-domain state, in the layout of snapshot version ver (tests write
-// older layouts with it; the engine always writes snapVersion).
-func writeSnapshotBody(w io.Writer, fp [32]byte, doms []*Domain, ver uint32) error {
+// the per-domain state, in the sealed snapshot layout.
+func writeSnapshotBody(w io.Writer, fp [32]byte, doms []*Domain) error {
 	write := func(v any) error { return binary.Write(w, binary.LittleEndian, v) }
-	recLen := repRecordLen
-	if ver < 3 {
-		recLen = repRecordLenV2
-	}
 	if _, err := w.Write(fp[:]); err != nil {
 		return err
 	}
@@ -202,7 +189,7 @@ func writeSnapshotBody(w io.Writer, fp [32]byte, doms []*Domain, ver uint32) err
 			copy(rec[64:96], it.BaseObjectKey[:])
 			binary.LittleEndian.PutUint32(rec[96:100], it.ObjectSize)
 			binary.LittleEndian.PutUint32(rec[100:104], it.BaseSize)
-			if _, err := w.Write(rec[:recLen]); err != nil {
+			if _, err := w.Write(rec[:repRecordLen]); err != nil {
 				return err
 			}
 		}
@@ -266,61 +253,35 @@ func (e *Engine) parseSnapshot(r io.Reader) ([]snapDomain, error) {
 	corrupt := func(why string) error { return fmt.Errorf("%w: %s", ErrSnapshotCorrupt, why) }
 	br := bufio.NewReaderSize(r, 1<<20)
 
-	// The header is in the clear in every version.
+	// Magic and version are cleartext. Anything other than snapVersion is
+	// refused before the body is read.
 	header := make([]byte, len(snapMagic)+4)
 	if _, err := io.ReadFull(br, header); err != nil || string(header[:len(snapMagic)]) != snapMagic {
 		return nil, corrupt("bad magic")
 	}
 	ver := binary.LittleEndian.Uint32(header[len(snapMagic):])
-	if ver < 1 || ver > snapVersion {
+	if ver != snapVersion {
 		return nil, corrupt(fmt.Sprintf("unsupported version %d", ver))
 	}
 
-	// Versions 1 and 2: the body follows in the clear and a SHA-256 of every
-	// preceding byte trails it. Hash on top of the buffered reader so only bytes
-	// actually consumed are hashed, not read-ahead (which would include the
-	// trailer). Version 3: the body is sealed; the frames authenticate it.
-	var (
-		body   io.Reader
-		h      hash.Hash
-		sealed *sealReader
-	)
-	if ver < snapSealed {
-		h = sha256.New()
-		h.Write(header)
-		body = io.TeeReader(br, h)
-	} else {
-		fileID := make([]byte, sealFileIDLen)
-		if _, err := io.ReadFull(br, fileID); err != nil {
-			return nil, corrupt("truncated header")
-		}
-		sr, err := newSealReader(br, e.snapKey, append(header, fileID...))
-		if err != nil {
-			return nil, corrupt(err.Error())
-		}
-		sealed, body = sr, sr
+	fileID := make([]byte, sealFileIDLen)
+	if _, err := io.ReadFull(br, fileID); err != nil {
+		return nil, corrupt("truncated header")
 	}
-	doms, err := e.parseSnapshotBody(body, ver)
+	sealed, err := newSealReader(br, e.snapKey, append(header, fileID...))
+	if err != nil {
+		return nil, corrupt(err.Error())
+	}
+	doms, err := e.parseSnapshotBody(sealed)
 	if err != nil {
 		return nil, err
 	}
-	if sealed != nil {
-		// Drain to the authenticated end: the last frame may be empty.
-		if _, err := io.Copy(io.Discard, sealed); err != nil {
-			return nil, corrupt(err.Error())
-		}
-		if !sealed.atEnd() {
-			return nil, corrupt(errSealTruncated.Error())
-		}
-	} else {
-		want := h.Sum(nil)
-		var got [32]byte
-		if _, err := io.ReadFull(br, got[:]); err != nil {
-			return nil, corrupt("truncated: missing checksum")
-		}
-		if !bytes.Equal(got[:], want) {
-			return nil, corrupt("checksum mismatch")
-		}
+	// Drain to the authenticated end: the last frame may be empty.
+	if _, err := io.Copy(io.Discard, sealed); err != nil {
+		return nil, corrupt(err.Error())
+	}
+	if !sealed.atEnd() {
+		return nil, corrupt(errSealTruncated.Error())
 	}
 	if _, err := br.ReadByte(); err != io.EOF {
 		return nil, corrupt("trailing bytes")
@@ -330,8 +291,8 @@ func (e *Engine) parseSnapshot(r io.Reader) ([]snapDomain, error) {
 
 // parseSnapshotBody reads the fingerprint and the domains. The body must have
 // been authenticated by the time its contents are used: the caller checks the
-// trailer (old versions) or the seal (version 3) before returning them.
-func (e *Engine) parseSnapshotBody(hr io.Reader, ver uint32) ([]snapDomain, error) {
+// seal before returning them.
+func (e *Engine) parseSnapshotBody(hr io.Reader) ([]snapDomain, error) {
 	corrupt := func(why string) error { return fmt.Errorf("%w: %s", ErrSnapshotCorrupt, why) }
 	read := func(v any) error {
 		if err := binary.Read(hr, binary.LittleEndian, v); err != nil {
@@ -377,15 +338,9 @@ func (e *Engine) parseSnapshotBody(hr io.Reader, ver uint32) ([]snapDomain, erro
 			return nil, corrupt("representation count exceeds configured maximum")
 		}
 		sd.reps = make([]repItem, 0, min(nrep, 1<<20))
-		// Version 3 added BaseSize to the record; older records are 100 bytes
-		// and load with BaseSize 0 (RepEntry.Complete reports false).
-		recLen := repRecordLen
-		if ver < 3 {
-			recLen = repRecordLenV2
-		}
 		var rec [repRecordLen]byte
 		for j := uint64(0); j < nrep; j++ {
-			if _, err := io.ReadFull(hr, rec[:recLen]); err != nil {
+			if _, err := io.ReadFull(hr, rec[:]); err != nil {
 				return nil, corrupt(err.Error())
 			}
 			var it repItem
@@ -393,27 +348,23 @@ func (e *Engine) parseSnapshotBody(hr io.Reader, ver uint32) ([]snapDomain, erro
 			copy(it.DeltaObjectKey[:], rec[32:64])
 			copy(it.BaseObjectKey[:], rec[64:96])
 			it.ObjectSize = binary.LittleEndian.Uint32(rec[96:100])
-			if recLen == repRecordLen {
-				it.BaseSize = binary.LittleEndian.Uint32(rec[100:104])
-			}
+			it.BaseSize = binary.LittleEndian.Uint32(rec[100:104])
 			sd.reps = append(sd.reps, it)
 		}
-		if ver >= 2 {
-			var nb uint64
-			if err := read(&nb); err != nil {
-				return nil, err
+		var nb uint64
+		if err := read(&nb); err != nil {
+			return nil, err
+		}
+		if nb > uint64(e.p.MaxEntries) {
+			return nil, corrupt("base count exceeds configured maximum")
+		}
+		sd.bases = make([]storedBase, 0, nb)
+		for j := uint64(0); j < nb; j++ {
+			b, err := readStoredBase(hr, e.p.Slots)
+			if err != nil {
+				return nil, corrupt(err.Error())
 			}
-			if nb > uint64(e.p.MaxEntries) {
-				return nil, corrupt("base count exceeds configured maximum")
-			}
-			sd.bases = make([]storedBase, 0, nb)
-			for j := uint64(0); j < nb; j++ {
-				b, err := readStoredBase(hr, e.p.Slots)
-				if err != nil {
-					return nil, corrupt(err.Error())
-				}
-				sd.bases = append(sd.bases, b)
-			}
+			sd.bases = append(sd.bases, b)
 		}
 		doms = append(doms, sd)
 	}

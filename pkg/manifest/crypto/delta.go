@@ -266,6 +266,7 @@ func (e *AESChunkEncryptor) OpenDeltaChunk(ctx context.Context, key [32]byte, ob
 	if h.Snappy {
 		out.Stream = make([]byte, h.StreamSize)
 		if err := decodeSnappyExact(payload, out.Stream); err != nil {
+			clear(out.Stream)
 			return DeltaOpened{}, err
 		}
 	} else {

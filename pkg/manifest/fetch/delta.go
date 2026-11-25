@@ -62,18 +62,40 @@ func (s *manifestStream) materializeDelta(ctx context.Context, chunkIdx uint64, 
 	if !ok {
 		return readerr.Mark(fmt.Errorf("chunk %d: decryptor cannot open delta objects", chunkIdx), false)
 	}
-	opened, err := opener.OpenDeltaChunk(ctx, s.keys[chunkIdx], ciphertext)
+	// The 46-byte header is cleartext, so the scratch charge is known before
+	// OpenDeltaChunk decrypts the payload and allocates the decoded stream.
+	hdr, err := crypto.ParseDeltaHeader(ciphertext)
 	if err != nil {
 		return fmt.Errorf("chunk %d: open delta: %w", chunkIdx, err)
 	}
-	if opened.Header.TargetSize != e.Size {
-		return readerr.Mark(fmt.Errorf("chunk %d: delta target size %d, entry size %d", chunkIdx, opened.Header.TargetSize, e.Size), false)
+	if hdr.TargetSize != e.Size {
+		return readerr.Mark(fmt.Errorf("chunk %d: delta target size %d, entry size %d", chunkIdx, hdr.TargetSize, e.Size), false)
 	}
-	charge := int64(opened.Header.BaseSize) + int64(len(opened.Stream))
+	// The header is unauthenticated when content verification is off; the
+	// manifest's delta table is covered by the key table's AAD.
+	ref, ok := s.m.DeltaFor(int(chunkIdx))
+	if !ok {
+		return readerr.Mark(fmt.Errorf("chunk %d: delta entry has no delta table row", chunkIdx), false)
+	}
+	if hdr.BaseObjectKey != ref.Base || hdr.BaseSize != ref.BaseSize {
+		return readerr.Mark(fmt.Errorf("chunk %d: delta names base %x (%d B), manifest says %x (%d B)",
+			chunkIdx, hdr.BaseObjectKey[:4], hdr.BaseSize, ref.Base[:4], ref.BaseSize), false)
+	}
+	charge := int64(hdr.BaseSize) + int64(hdr.StreamSize)
 	if err := s.scratch.acquire(ctx, charge); err != nil {
 		return fmt.Errorf("chunk %d: delta scratch: %w", chunkIdx, err)
 	}
 	defer s.scratch.release(charge)
+
+	opened, err := opener.OpenDeltaChunk(ctx, s.keys[chunkIdx], ciphertext)
+	if err != nil {
+		return fmt.Errorf("chunk %d: open delta: %w", chunkIdx, err)
+	}
+	defer clear(opened.BaseKey[:])
+	defer clearSlice(opened.Stream)
+	if uint32(len(opened.Stream)) != hdr.StreamSize {
+		return readerr.Mark(fmt.Errorf("chunk %d: decoded delta stream is %d bytes, header says %d", chunkIdx, len(opened.Stream), hdr.StreamSize), false)
+	}
 
 	base, release, err := s.basePlaintext(ctx, chunkIdx, opened.Header.BaseObjectKey, opened.BaseKey, int(opened.Header.BaseSize))
 	if err != nil {

@@ -275,8 +275,7 @@ func (r *manifestDataRun) prefetch(ctx context.Context) error {
 // prefetchBase warms the base object of a delta entry through the prefetch
 // getter, so the first read of the chunk finds both objects in the cache and
 // pays only the decrypt and apply. The base's address comes from the
-// manifest's delta table (Version2); a Version1 manifest has no table and the
-// base is fetched on first read. The base's plaintext cannot be prepared here:
+// manifest's delta table. The base's plaintext cannot be prepared here:
 // its key lives inside the delta object and is only available once that has
 // been opened under the chunk's key.
 func (s *manifestStream) prefetchBase(ctx context.Context, chunkIdx uint64) error {
@@ -436,7 +435,10 @@ func (s *manifestStream) readChunkDirect(
 	if s.verifyContent && sha256.Sum256(ciphertext) != e.CiphertextHash {
 		return 0, readerr.Mark(fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx), false)
 	}
-	if isDeltaObject(ciphertext) {
+	if err := checkDeltaFlag(chunkIdx, e, ciphertext); err != nil {
+		return 0, err
+	}
+	if e.IsDelta {
 		if offset == e.Offset && uint64(len(buf)) == uint64(e.Size) {
 			if err := s.materializeDelta(ctx, chunkIdx, e, ciphertext, buf); err != nil {
 				return 0, err
@@ -484,8 +486,12 @@ func (s *manifestStream) loadOwnedPlainChunk(ctx context.Context, chunkIdx uint6
 		blob.Release()
 		return nil, readerr.Mark(fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx), false)
 	}
+	if err := checkDeltaFlag(chunkIdx, e, ciphertext); err != nil {
+		blob.Release()
+		return nil, err
+	}
 	plain := make([]byte, e.Size)
-	if isDeltaObject(ciphertext) {
+	if e.IsDelta {
 		err = s.materializeDelta(ctx, chunkIdx, e, ciphertext, plain)
 	} else {
 		err = s.decryptor.DecryptChunkTo(ctx, s.keys[chunkIdx], ciphertext, plain)
@@ -493,7 +499,7 @@ func (s *manifestStream) loadOwnedPlainChunk(ctx context.Context, chunkIdx uint6
 	blob.Release()
 	if err != nil {
 		clearSlice(plain)
-		if isDeltaObject(ciphertext) {
+		if e.IsDelta {
 			return nil, err
 		}
 		return nil, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
@@ -503,6 +509,19 @@ func (s *manifestStream) loadOwnedPlainChunk(ctx context.Context, chunkIdx uint6
 
 func isDeltaObject(object []byte) bool {
 	return len(object) > 0 && object[0] == crypto.ChunkFormatAESDelta
+}
+
+// checkDeltaFlag requires the object's format byte to agree with the entry's
+// delta flag. The flag is authenticated by the key table's AAD; the format byte
+// is not when content verification is off.
+func checkDeltaFlag(chunkIdx uint64, e codec.ChunkEntry, ciphertext []byte) error {
+	if isDeltaObject(ciphertext) == e.IsDelta {
+		return nil
+	}
+	if e.IsDelta {
+		return readerr.Mark(fmt.Errorf("chunk %d: manifest entry is flagged delta but the object is not a delta", chunkIdx), false)
+	}
+	return readerr.Mark(fmt.Errorf("chunk %d: object is a delta but its manifest entry is not flagged delta", chunkIdx), false)
 }
 
 func copyChunkRange(

@@ -151,6 +151,9 @@ func verifyAndUploadExactManifests(ctx context.Context, root ExactManifest, depe
 		}
 	}
 
+	if err := checkDeltaUpload(target, decryptor, hasDeltaRef(chunkRefs)); err != nil {
+		return err
+	}
 	if err := verifyExactChunks(ctx, chunkOrder, chunkRefs, decryptor, target, opts); err != nil {
 		return err
 	}
@@ -289,10 +292,10 @@ func verifyExactChunks(ctx context.Context, chunks []exactChunk, refs map[exactC
 				}
 				admission := chunk.reader.Admission()
 				if target != nil {
-					if _, err := target.Put(workCtx, admission, store.PartitionChunk, chunk.key, physical); err != nil {
+					if err := uploadChunk(workCtx, target, decryptor, admission, chunk.key, reference, physical, plain); err != nil {
 						blob.Release()
 						clear(plain)
-						fail(fmt.Errorf("manifest bundle: upload Chunk %s: %w", hex.EncodeToString(chunk.key[:]), err))
+						fail(err)
 						continue
 					}
 				}

@@ -385,6 +385,62 @@ func TestAdoptionRejectsUnusableAliases(t *testing.T) {
 		}
 	})
 
+	// The adopting node already holds the base in its pool, so leaseBase never
+	// reads it back. The delta's stream is valid against that base, but its base
+	// key or its header's base size is wrong. Cold readers would fail on either,
+	// so a pool hit must be verified as strictly as a read-back.
+	for _, tc := range []struct {
+		name    string
+		key     func(real [32]byte) [32]byte
+		sizeAdd int
+	}{
+		{"pooled base, delta carries a wrong base key", func([32]byte) [32]byte { return [32]byte{0xde, 0xad} }, 0},
+		{"pooled base, delta header claims another base size", func(real [32]byte) [32]byte { return real }, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newMemStore()
+			a, _ := newNode(t, st, nil)
+			ingestImage(t, a, v0)
+
+			ctx := context.Background()
+			enc := testEncryptor()
+			salt := [32]byte{}
+			basePlain := v0[:deltaChunk]
+			target := v1[:deltaChunk]
+			_, baseObj, baseKey, err := enc.EncryptChunk(ctx, salt, basePlain)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, indepHash, _, err := enc.EncryptChunk(ctx, salt, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			obj, objHash, _, err := enc.(crypto.DeltaEncryptor).EncryptDeltaChunk(ctx, salt,
+				crypto.DeltaBase{ObjectKey: baseObj, Key: tc.key(baseKey), PlaintextSize: len(basePlain) + tc.sizeAdd},
+				target, delta.Encode(basePlain, target))
+			if err != nil {
+				t.Fatal(err)
+			}
+			st.chunks[store.ContentKey(objHash)] = obj
+			st.aliases[store.ContentKey(indepHash)] = store.ContentKey(objHash)
+
+			b, engB := newNode(t, st, nil)
+			ingestImage(t, b, v0) // registers v0's chunks as bases: the base is pooled
+			if _, release, ok := engB.Domain(salt).AcquireBase(baseObj); !ok {
+				t.Fatal("setup: the base must be in the adopting node's pool")
+			} else {
+				release()
+			}
+			rb := ingestImage(t, b, v1)
+			if rb.DeltaAdoptFailed != 1 {
+				t.Fatalf("a pooled base must be verified against the delta's key and size: %+v", rb)
+			}
+			if !bytes.Equal(readBack(t, st, rb.ManifestKey), v1) {
+				t.Fatal("does not read back")
+			}
+		})
+	}
+
 	t.Run("cannot be checked: store read fails", func(t *testing.T) {
 		st := primed(t)
 		var failing atomic.Bool

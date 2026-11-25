@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -95,15 +97,29 @@ func deltaFixture(t *testing.T) (target []byte, deltaObj []byte, deltaKey [32]by
 	return target, deltaObj, deltaKey, baseHash, dec, g
 }
 
+// deltaManifest returns a one-entry Version2 manifest whose entry is flagged
+// delta and whose delta table names the base the object header names.
+func deltaManifest(t *testing.T, target, deltaObj []byte) *codec.Manifest {
+	t.Helper()
+	hdr, err := crypto.ParseDeltaHeader(deltaObj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &codec.Manifest{
+		Version:   codec.Version2,
+		ImageSize: uint64(len(target)),
+		Entries:   []codec.ChunkEntry{{Offset: 0, Size: uint32(len(target)), CiphertextHash: sha256.Sum256(deltaObj), IsDelta: true}},
+		Deltas:    []codec.DeltaRef{{Entry: 0, BaseSize: hdr.BaseSize, Base: hdr.BaseObjectKey}},
+	}
+}
+
 // deltaStream wraps deltaObj in a one-entry manifestStream. The entry is keyed by
 // deltaKey and reads through g. The delta scratch budget is set to scratch, so a
 // test can make it too small on purpose.
 func deltaStream(t *testing.T, target, deltaObj []byte, deltaKey [32]byte, enc crypto.Decryptor, g cache.Getter, scratch int64) *manifestStream {
 	t.Helper()
-	hash := sha256.Sum256(deltaObj)
-	e := codec.ChunkEntry{Offset: 0, Size: uint32(len(target)), CiphertextHash: hash}
 	return newManifestStreamWithOptions(
-		&codec.Manifest{ImageSize: uint64(len(target)), Entries: []codec.ChunkEntry{e}},
+		deltaManifest(t, target, deltaObj),
 		[][32]byte{deltaKey},
 		g, g, enc,
 		Options{VerifyContent: true, DeltaScratchBytes: scratch, DeltaBaseCacheBytes: 4 << 20},
@@ -230,9 +246,12 @@ func TestBaseCacheIsKeyedByDecryptionKey(t *testing.T) {
 
 	// One manifest, two entries, one shared base cache.
 	n := uint64(len(target))
-	m := &codec.Manifest{ImageSize: 2 * n, Entries: []codec.ChunkEntry{
-		{Offset: 0, Size: uint32(n), CiphertextHash: sha256.Sum256(bad)},
-		{Offset: n, Size: uint32(n), CiphertextHash: sha256.Sum256(good)},
+	m := &codec.Manifest{Version: codec.Version2, ImageSize: 2 * n, Entries: []codec.ChunkEntry{
+		{Offset: 0, Size: uint32(n), CiphertextHash: sha256.Sum256(bad), IsDelta: true},
+		{Offset: n, Size: uint32(n), CiphertextHash: sha256.Sum256(good), IsDelta: true},
+	}, Deltas: []codec.DeltaRef{
+		{Entry: 0, BaseSize: uint32(len(base)), Base: baseHash},
+		{Entry: 1, BaseSize: uint32(len(base)), Base: baseHash},
 	}}
 	s := newManifestStreamWithOptions(m, [][32]byte{badKey, goodKey}, g, g, dec,
 		Options{VerifyContent: true, DeltaScratchBytes: 32 << 20, DeltaBaseCacheBytes: 4 << 20})
@@ -267,63 +286,44 @@ func TestBaseCacheIsKeyedByDecryptionKey(t *testing.T) {
 	}
 }
 
-// TestPrefetchWarmsDeltaBases checks prefetch of delta chunks. A Version2
-// manifest's prefetch fetches the base named by the delta table through the
-// prefetch getter, alongside the delta object. A Version1 manifest has no table,
-// so only the delta is prefetched. Reads after prefetch still rebuild the chunk.
-// A base missing from the prefetch getter must be reported as an error.
+// TestPrefetchWarmsDeltaBases checks prefetch of delta chunks. Prefetch fetches
+// the base named by the delta table through the prefetch getter, alongside the
+// delta object, and a read after prefetch still rebuilds the chunk. A base
+// missing from the prefetch getter must be reported as an error.
 func TestPrefetchWarmsDeltaBases(t *testing.T) {
 	target, obj, key, baseKey, dec, onDemand := deltaFixture(t)
 	hash := sha256.Sum256(obj)
-	for _, tc := range []struct {
-		name      string
-		version   uint8
-		wantBase  int
-		withTable bool
-	}{
-		{"version2", codec.Version2, 1, true},
-		{"version1", codec.Version1, 0, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			prefetch := newMapGetter()
-			prefetch.put(obj)
-			prefetch.objs[baseKey] = onDemand.objs[baseKey]
-			e := codec.ChunkEntry{Offset: 0, Size: uint32(len(target)), CiphertextHash: hash, IsDelta: tc.withTable}
-			m := &codec.Manifest{Version: tc.version, ImageSize: uint64(len(target)), Entries: []codec.ChunkEntry{e}}
-			if tc.withTable {
-				m.Deltas = []codec.DeltaRef{{Entry: 0, BaseSize: uint32(len(target)), Base: baseKey}}
-			}
-			s := newManifestStreamWithOptions(m, [][32]byte{key}, onDemand, prefetch, dec,
-				Options{VerifyContent: true, DeltaScratchBytes: 32 << 20, DeltaBaseCacheBytes: 4 << 20})
-			defer s.Close()
-			if err := prefetchStream(context.Background(), s); err != nil {
-				t.Fatal(err)
-			}
-			if got := prefetch.count(hash); got != 1 {
-				t.Fatalf("delta object prefetched %d times, want 1", got)
-			}
-			if got := prefetch.count(baseKey); got != tc.wantBase {
-				t.Fatalf("base prefetched %d times, want %d", got, tc.wantBase)
-			}
-			// Prefetch warms the cache only; the read still rebuilds correctly.
-			got := make([]byte, len(target))
-			if _, err := s.readChunkAt(context.Background(), got, 0, 0); err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(got, target) {
-				t.Fatal("read after prefetch does not rebuild the chunk")
-			}
-		})
-	}
+
+	t.Run("warms the base", func(t *testing.T) {
+		prefetch := newMapGetter()
+		prefetch.put(obj)
+		prefetch.objs[baseKey] = onDemand.objs[baseKey]
+		s := newManifestStreamWithOptions(deltaManifest(t, target, obj), [][32]byte{key}, onDemand, prefetch, dec,
+			Options{VerifyContent: true, DeltaScratchBytes: 32 << 20, DeltaBaseCacheBytes: 4 << 20})
+		defer s.Close()
+		if err := prefetchStream(context.Background(), s); err != nil {
+			t.Fatal(err)
+		}
+		if got := prefetch.count(hash); got != 1 {
+			t.Fatalf("delta object prefetched %d times, want 1", got)
+		}
+		if got := prefetch.count(baseKey); got != 1 {
+			t.Fatalf("base prefetched %d times, want 1", got)
+		}
+		// Prefetch warms the cache only; the read still rebuilds correctly.
+		got := make([]byte, len(target))
+		if _, err := s.readChunkAt(context.Background(), got, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, target) {
+			t.Fatal("read after prefetch does not rebuild the chunk")
+		}
+	})
 
 	t.Run("missing base is reported", func(t *testing.T) {
 		prefetch := newMapGetter()
 		prefetch.put(obj)
-		m := &codec.Manifest{Version: codec.Version2, ImageSize: uint64(len(target)),
-			Entries: []codec.ChunkEntry{{Offset: 0, Size: uint32(len(target)), CiphertextHash: hash, IsDelta: true}},
-			Deltas:  []codec.DeltaRef{{Entry: 0, BaseSize: uint32(len(target)), Base: baseKey}},
-		}
-		s := newManifestStreamWithOptions(m, [][32]byte{key}, onDemand, prefetch, dec,
+		s := newManifestStreamWithOptions(deltaManifest(t, target, obj), [][32]byte{key}, onDemand, prefetch, dec,
 			Options{VerifyContent: true, DeltaScratchBytes: 32 << 20, DeltaBaseCacheBytes: 4 << 20})
 		defer s.Close()
 		if err := prefetchStream(context.Background(), s); err == nil {
@@ -343,5 +343,59 @@ func TestMaterializeDeltaScratchBudget(t *testing.T) {
 	_, err := s.readChunkAt(context.Background(), make([]byte, len(target)), 0, 0)
 	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("scratch")) {
 		t.Fatalf("want a scratch-budget failure, got %v", err)
+	}
+}
+
+// TestDeltaReadsBindToManifest checks that a read trusts the authenticated
+// manifest over the object: the entry's delta flag must match the object's
+// format byte, and the delta table must name the base and base size the object
+// header names. Each case runs with content verification on and off, through
+// the full-chunk path and the partial-read path, and the base is never fetched.
+func TestDeltaReadsBindToManifest(t *testing.T) {
+	target, obj, key, baseKey, dec, g := deltaFixture(t)
+	baseObj := g.objs[baseKey]
+
+	for _, tc := range []struct {
+		name string
+		mut  func(m *codec.Manifest)
+		want string
+	}{
+		{"delta object, entry not flagged", func(m *codec.Manifest) {
+			m.Version, m.Entries[0].IsDelta, m.Deltas = codec.Version1, false, nil
+		}, "not flagged delta"},
+		{"flagged entry, independent object", func(m *codec.Manifest) {
+			m.Entries[0].CiphertextHash = sha256.Sum256(baseObj)
+		}, "object is not a delta"},
+		{"table names another base", func(m *codec.Manifest) {
+			m.Deltas[0].Base[0] ^= 0xff
+		}, "manifest says"},
+		{"table names another base size", func(m *codec.Manifest) {
+			m.Deltas[0].BaseSize++
+		}, "manifest says"},
+	} {
+		for _, verify := range []bool{true, false} {
+			for _, partial := range []bool{false, true} {
+				name := fmt.Sprintf("%s/verify=%v/partial=%v", tc.name, verify, partial)
+				t.Run(name, func(t *testing.T) {
+					m := deltaManifest(t, target, obj)
+					tc.mut(m)
+					s := newManifestStreamWithOptions(m, [][32]byte{key}, g, g, dec,
+						Options{VerifyContent: verify, DeltaScratchBytes: 32 << 20, DeltaBaseCacheBytes: 4 << 20})
+					defer s.Close()
+					before := g.count(baseKey)
+					buf := make([]byte, len(target))
+					if partial {
+						buf = buf[:64]
+					}
+					_, err := s.readChunkAt(context.Background(), buf, 0, 0)
+					if err == nil || !strings.Contains(err.Error(), tc.want) {
+						t.Fatalf("want an error containing %q, got %v", tc.want, err)
+					}
+					if tc.name != "flagged entry, independent object" && g.count(baseKey) != before {
+						t.Fatal("the base must not be fetched when the manifest and the object disagree")
+					}
+				})
+			}
+		}
 	}
 }

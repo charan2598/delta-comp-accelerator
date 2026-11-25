@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
@@ -32,12 +33,23 @@ type deltaBundleFixture struct {
 }
 
 func newDeltaBundleFixture(t *testing.T) *deltaBundleFixture {
+	return newDeltaBundleFixtureWithChunkSalt(t, nil)
+}
+
+// newDeltaBundleFixtureWithChunkSalt encrypts the chunks under chunkSalt
+// instead of the admission salt when it is non-nil, as a writer with an extra
+// salt does.
+func newDeltaBundleFixtureWithChunkSalt(t *testing.T, chunkSalt *[32]byte) *deltaBundleFixture {
 	t.Helper()
-	salt, err := store.SaltForGeneration("G1")
+	admissionSalt, err := store.SaltForGeneration("G1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &deltaBundleFixture{admission: store.WriteAdmission{Generation: "G1", Salt: salt}}
+	salt := admissionSalt
+	if chunkSalt != nil {
+		salt = *chunkSalt
+	}
+	f := &deltaBundleFixture{admission: store.WriteAdmission{Generation: "G1", Salt: admissionSalt}}
 	f.customer[0] = 0x42
 	f.enc, f.dec, err = manifestcrypto.New(manifestcrypto.Config{Chunk: "aes", Manifest: "aes"})
 	if err != nil {
@@ -132,7 +144,7 @@ func TestBundleFullVerifyAcceptsDeltaWithExternalBase(t *testing.T) {
 	}
 	// Upload publishes the base too (it must reach the target before any
 	// reader can be handed v1).
-	target := &recordingExactStore{accepted: f.admission, pool: 2}
+	target := newAliasExactStore(f.admission)
 	if err := r.Upload(context.Background(), f.v1Key, f.customer, f.dec, target, VerifyOptions{Workers: 2}); err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
@@ -273,4 +285,205 @@ func TestBundleCopyManifestIncludesDeltaBases(t *testing.T) {
 	if err := both.FullVerify(context.Background(), f.v1Key, f.customer, f.dec, VerifyOptions{}); err != nil {
 		t.Fatalf("FullVerify with shared base: %v", err)
 	}
+}
+
+// aliasExactStore is a recordingExactStore that also records aliases the way
+// the Store server does: the first object named for a chunk wins, a later
+// different object loses, and a losing object the same call created is deleted.
+type aliasExactStore struct {
+	*recordingExactStore
+
+	amu         sync.Mutex
+	aliases     map[store.ContentKey]store.ContentKey
+	aliasAt     map[store.ContentKey]int // number of Puts recorded when the alias was attempted
+	unsupported bool
+}
+
+func newAliasExactStore(admission store.WriteAdmission) *aliasExactStore {
+	return &aliasExactStore{
+		recordingExactStore: &recordingExactStore{accepted: admission, pool: 2},
+		aliases:             map[store.ContentKey]store.ContentKey{},
+		aliasAt:             map[store.ContentKey]int{},
+	}
+}
+
+func (s *aliasExactStore) PutRepresenting(_ context.Context, _ store.WriteAdmission, key store.ContentKey, _ []byte, represents store.ContentKey) (store.PutResult, error) {
+	_, _, puts := s.snapshot()
+	exists := false
+	for _, p := range puts {
+		if p.partition == store.PartitionChunk && p.key == key {
+			exists = true
+		}
+	}
+	s.amu.Lock()
+	defer s.amu.Unlock()
+	s.aliasAt[key] = len(puts)
+	if s.unsupported {
+		return store.PutResult{}, nil
+	}
+	current, ok := s.aliases[represents]
+	if !ok || current == key {
+		s.aliases[represents] = key
+		return store.PutResult{IsNew: !exists, Represented: store.RepresentedWon}, nil
+	}
+	return store.PutResult{IsNew: !exists, Represented: store.RepresentedLost, Key: current, Discarded: !exists}, nil
+}
+
+func (f *deltaBundleFixture) independentAddress(t *testing.T) store.ContentKey {
+	t.Helper()
+	_, hInd, _, err := f.enc.EncryptChunk(context.Background(), f.admission.Salt, f.target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store.ContentKey(hInd)
+}
+
+func manifestPuts(puts []recordedPut) int {
+	n := 0
+	for _, p := range puts {
+		if p.partition == store.PartitionManifest {
+			n++
+		}
+	}
+	return n
+}
+
+// Checks that uploading a Bundle with a delta object records the alias that
+// names it under the chunk's independent address, after the object itself is
+// stored and before any Manifest is published, so store-ctl delta-gc does not
+// treat it as an orphan. Covers both single-Bundle and multi-Bundle upload.
+func TestBundleUploadRecordsDeltaAliases(t *testing.T) {
+	f := newDeltaBundleFixture(t)
+	hInd := f.independentAddress(t)
+	chunks := map[store.ContentKey][]byte{f.baseKey: f.baseObj, f.deltaKey: f.deltaObj}
+	manifests := map[store.ContentKey][]byte{f.v1Key: f.v1}
+
+	check := func(t *testing.T, target *aliasExactStore) {
+		t.Helper()
+		if got, ok := target.aliases[hInd]; !ok || got != f.deltaKey {
+			t.Fatalf("alias for the chunk = %x (present %v), want the delta object %x", got[:4], ok, f.deltaKey[:4])
+		}
+		if len(target.aliases) != 1 {
+			t.Fatalf("%d aliases recorded, want 1 (only delta objects get one)", len(target.aliases))
+		}
+		_, _, puts := target.snapshot()
+		at := target.aliasAt[f.deltaKey]
+		storedBefore := false
+		for i, p := range puts {
+			if p.partition == store.PartitionChunk && p.key == f.deltaKey && i < at {
+				storedBefore = true
+			}
+			if p.partition == store.PartitionManifest && i < at {
+				t.Fatal("a Manifest was published before the delta object's alias")
+			}
+		}
+		if !storedBefore {
+			t.Fatal("the alias was requested before the delta object was stored")
+		}
+	}
+
+	t.Run("Upload", func(t *testing.T) {
+		r := f.bundle(t, f.v1Key, chunks, manifests)
+		target := newAliasExactStore(f.admission)
+		if err := r.Upload(context.Background(), f.v1Key, f.customer, f.dec, target, VerifyOptions{Workers: 2}); err != nil {
+			t.Fatalf("Upload: %v", err)
+		}
+		check(t, target)
+	})
+	t.Run("UploadExactManifests", func(t *testing.T) {
+		r := f.bundle(t, f.v1Key, chunks, manifests)
+		target := newAliasExactStore(f.admission)
+		if err := UploadExactManifests(context.Background(), ExactManifest{Key: f.v1Key, Reader: r}, nil, f.customer, f.dec, target, VerifyOptions{Workers: 2}); err != nil {
+			t.Fatalf("UploadExactManifests: %v", err)
+		}
+		check(t, target)
+	})
+	t.Run("re-upload finds its own alias", func(t *testing.T) {
+		r := f.bundle(t, f.v1Key, chunks, manifests)
+		target := newAliasExactStore(f.admission)
+		target.aliases[hInd] = f.deltaKey
+		if err := r.Upload(context.Background(), f.v1Key, f.customer, f.dec, target, VerifyOptions{}); err != nil {
+			t.Fatalf("Upload over an alias that already names the same object: %v", err)
+		}
+	})
+}
+
+// Checks each case where the alias cannot be recorded. The upload must fail
+// with ErrDeltaAlias and must not publish any Manifest, so the uploaded delta
+// object stays unreferenced and delta-gc may remove it. An object the target
+// already holds is never deleted by the alias attempt.
+func TestBundleUploadRefusesDeltaWithoutAlias(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("target cannot record aliases", func(t *testing.T) {
+		f := newDeltaBundleFixture(t)
+		r := f.bundle(t, f.v1Key, map[store.ContentKey][]byte{f.baseKey: f.baseObj, f.deltaKey: f.deltaObj}, map[store.ContentKey][]byte{f.v1Key: f.v1})
+		target := &recordingExactStore{accepted: f.admission, pool: 2}
+		err := r.Upload(ctx, f.v1Key, f.customer, f.dec, target, VerifyOptions{})
+		if !errors.Is(err, ErrDeltaAlias) {
+			t.Fatalf("Upload = %v, want ErrDeltaAlias", err)
+		}
+		if _, _, puts := target.snapshot(); len(puts) != 0 {
+			t.Fatalf("%d objects uploaded; the capability check must run before any Put", len(puts))
+		}
+		err = UploadExactManifests(ctx, ExactManifest{Key: f.v1Key, Reader: r}, nil, f.customer, f.dec, target, VerifyOptions{})
+		if !errors.Is(err, ErrDeltaAlias) {
+			t.Fatalf("UploadExactManifests = %v, want ErrDeltaAlias", err)
+		}
+	})
+
+	t.Run("store does not record the alias", func(t *testing.T) {
+		f := newDeltaBundleFixture(t)
+		r := f.bundle(t, f.v1Key, map[store.ContentKey][]byte{f.baseKey: f.baseObj, f.deltaKey: f.deltaObj}, map[store.ContentKey][]byte{f.v1Key: f.v1})
+		target := newAliasExactStore(f.admission)
+		target.unsupported = true
+		err := r.Upload(ctx, f.v1Key, f.customer, f.dec, target, VerifyOptions{})
+		if !errors.Is(err, ErrDeltaAlias) {
+			t.Fatalf("Upload = %v, want ErrDeltaAlias", err)
+		}
+		if _, _, puts := target.snapshot(); manifestPuts(puts) != 0 {
+			t.Fatal("a Manifest was published although its delta object has no alias")
+		}
+	})
+
+	t.Run("target represents the chunk by another delta object", func(t *testing.T) {
+		f := newDeltaBundleFixture(t)
+		r := f.bundle(t, f.v1Key, map[store.ContentKey][]byte{f.baseKey: f.baseObj, f.deltaKey: f.deltaObj}, map[store.ContentKey][]byte{f.v1Key: f.v1})
+		target := newAliasExactStore(f.admission)
+		other := store.ContentKey{0x0f}
+		target.aliases[f.independentAddress(t)] = other
+		err := r.Upload(ctx, f.v1Key, f.customer, f.dec, target, VerifyOptions{})
+		if !errors.Is(err, ErrDeltaAlias) || !strings.Contains(err.Error(), "another delta object") {
+			t.Fatalf("Upload = %v, want ErrDeltaAlias naming the conflict", err)
+		}
+		if _, _, puts := target.snapshot(); manifestPuts(puts) != 0 {
+			t.Fatal("a Manifest was published although the alias names another object")
+		}
+		if target.aliases[f.independentAddress(t)] != other {
+			t.Fatal("the existing alias was changed")
+		}
+	})
+
+	t.Run("manifest written under an extra salt", func(t *testing.T) {
+		extra := [32]byte{0xe5}
+		f := newDeltaBundleFixtureWithChunkSalt(t, &extra)
+		r := f.bundle(t, f.v1Key, map[store.ContentKey][]byte{f.baseKey: f.baseObj, f.deltaKey: f.deltaObj}, map[store.ContentKey][]byte{f.v1Key: f.v1})
+		if err := r.FullVerify(ctx, f.v1Key, f.customer, f.dec, VerifyOptions{}); err != nil {
+			t.Fatalf("setup: the Bundle must still verify: %v", err)
+		}
+		target := newAliasExactStore(f.admission)
+		err := r.Upload(ctx, f.v1Key, f.customer, f.dec, target, VerifyOptions{})
+		if !errors.Is(err, ErrDeltaAlias) || !strings.Contains(err.Error(), "extra salt") {
+			t.Fatalf("Upload = %v, want ErrDeltaAlias for an extra salt", err)
+		}
+		_, _, puts := target.snapshot()
+		for _, p := range puts {
+			if p.key == f.deltaKey || p.partition == store.PartitionManifest {
+				t.Fatalf("uploaded %s %x; the delta object and Manifests must not be uploaded", p.partition, p.key[:4])
+			}
+		}
+		if len(target.aliases) != 0 {
+			t.Fatal("an alias was recorded under a guessed independent address")
+		}
+	})
 }

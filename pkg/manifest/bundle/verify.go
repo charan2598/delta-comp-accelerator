@@ -174,6 +174,9 @@ func (r *Reader) verifyAndUpload(ctx context.Context, root store.ContentKey, cus
 		}
 	}
 
+	if err := checkDeltaUpload(target, decryptor, hasDeltaRef(chunkRefs)); err != nil {
+		return err
+	}
 	chunkKeys := sortedKeys(r.chunks)
 	if err := r.verifyChunks(ctx, chunkKeys, chunkRefs, decryptor, target, opts); err != nil {
 		return err
@@ -257,10 +260,10 @@ func (r *Reader) verifyChunks(ctx context.Context, keys []store.ContentKey, refs
 					continue
 				}
 				if target != nil {
-					if _, err := target.Put(workCtx, r.admission, store.PartitionChunk, key, physical); err != nil {
+					if err := uploadChunk(workCtx, target, decryptor, r.admission, key, reference, physical, plain); err != nil {
 						blob.Release()
 						clear(plain)
-						fail(fmt.Errorf("manifest bundle: upload Chunk %s: %w", hex.EncodeToString(key[:]), err))
+						fail(err)
 						continue
 					}
 				}
@@ -326,6 +329,15 @@ func (r *Reader) uploadManifest(ctx context.Context, target ExactStore, key stor
 		return fmt.Errorf("manifest bundle: upload Manifest %s: %w", hex.EncodeToString(key[:]), err)
 	}
 	return nil
+}
+
+func hasDeltaRef[K comparable](refs map[K]chunkReference) bool {
+	for _, reference := range refs {
+		if reference.kind == refDelta {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys[T any](objects map[store.ContentKey]T) []store.ContentKey {

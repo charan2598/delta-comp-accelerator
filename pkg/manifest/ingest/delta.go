@@ -521,12 +521,25 @@ func (r *deltaRuntime) readObject(ctx context.Context, key [32]byte) ([]byte, er
 // the caller supplied, and admitted to the pool so the next chunk does not fetch
 // it again. A nil buffer with a nil error means "skip this candidate".
 //
-// The key normally comes from our own index and is trusted. With verify, it came
-// from a delta object someone else wrote, so the decrypted plaintext is
-// re-encrypted and must hash to the object's key before it is admitted;
-// otherwise errBaseRejected.
+// The key and size normally come from our own index and are trusted. With
+// verify, they came from a delta object someone else wrote, so the plaintext,
+// whether pooled or read back, must re-encrypt to the object's key under the
+// candidate's base key before it is used; otherwise errBaseRejected.
 func (r *deltaRuntime) leaseBase(ctx context.Context, dom *delta.Domain, cand delta.Candidate, verify bool, c *deltaCounters) ([]byte, func(), error) {
 	if plain, release, ok := dom.AcquireBase(cand.ObjectKey); ok {
+		if uint32(len(plain)) != cand.Size {
+			release()
+			if verify {
+				return nil, nil, fmt.Errorf("%w: base is %d bytes, header claims %d", errBaseRejected, len(plain), cand.Size)
+			}
+			return nil, nil, fmt.Errorf("pooled base is %d bytes, index says %d", len(plain), cand.Size)
+		}
+		if verify {
+			if err := r.verifyBase(ctx, dom, cand, plain); err != nil {
+				release()
+				return nil, nil, err
+			}
+		}
 		return plain, release, nil
 	}
 	object, err := r.readObject(ctx, cand.ObjectKey)
@@ -557,16 +570,9 @@ func (r *deltaRuntime) leaseBase(ctx context.Context, dom *delta.Domain, cand de
 		return nil, nil, err
 	}
 	if verify {
-		// The base is an independent object under this salt, so encrypting its
-		// plaintext again must reproduce its exact bytes.
-		_, again, _, err := r.indep.EncryptChunk(ctx, dom.Salt(), plain)
-		if err != nil {
+		if err := r.verifyBase(ctx, dom, cand, plain); err != nil {
 			clear(plain)
 			return nil, nil, err
-		}
-		if again != cand.ObjectKey {
-			clear(plain)
-			return nil, nil, errBaseRejected
 		}
 	}
 	c.readbacks.Add(1)
@@ -580,6 +586,21 @@ func (r *deltaRuntime) leaseBase(ctx context.Context, dom *delta.Domain, cand de
 		clear(buf)
 	}
 	return leased, release, nil
+}
+
+// verifyBase proves that plain is the plaintext of the independent object
+// cand.ObjectKey under this domain's salt and that cand.BaseKey is the key that
+// decrypts it: encrypting plain again must reproduce the object's address and
+// derive the same key. Otherwise errBaseRejected.
+func (r *deltaRuntime) verifyBase(ctx context.Context, dom *delta.Domain, cand delta.Candidate, plain []byte) error {
+	_, again, key, err := r.indep.EncryptChunk(ctx, dom.Salt(), plain)
+	if err != nil {
+		return err
+	}
+	if again != cand.ObjectKey || key != cand.BaseKey {
+		return errBaseRejected
+	}
+	return nil
 }
 
 // deltaPut is what the store ended up holding for a chunk this node encoded as a

@@ -2,10 +2,8 @@ package delta
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -399,52 +397,24 @@ func TestSnapshotMultiFrame(t *testing.T) {
 	}
 }
 
-// Checks that a version 2 snapshot, written in the clear with a SHA-256 trailer,
-// still loads, with its representation entries marked incomplete. The next
-// snapshot written by the upgraded engine is sealed.
-func TestSnapshotLoadsClearVersion2(t *testing.T) {
+// Checks that a snapshot whose version field is not snapVersion is refused
+// before its body is read, and that the engine starts empty.
+func TestSnapshotRejectsOtherVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snap")
-	src := snapEngine(t, filepath.Join(t.TempDir(), "unused"), nil)
-	populate(src)
-	src.mu.Lock()
-	doms := make([]*Domain, 0, len(src.domains))
-	for _, d := range src.domains {
-		doms = append(doms, d)
-	}
-	src.mu.Unlock()
-
 	var buf bytes.Buffer
-	h := sha256.New()
-	w := io.MultiWriter(&buf, h)
-	io.WriteString(w, snapMagic)
-	binary.Write(w, binary.LittleEndian, uint32(2))
-	if err := writeSnapshotBody(w, src.Params().Fingerprint(), doms, 2); err != nil {
-		t.Fatal(err)
-	}
-	buf.Write(h.Sum(nil))
+	buf.WriteString(snapMagic)
+	binary.Write(&buf, binary.LittleEndian, snapVersion+1)
+	buf.Write(make([]byte, 64))
 	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	e := snapEngine(t, path, nil)
-	if err := e.LoadErr(); err != nil {
-		t.Fatal(err)
+	if !errors.Is(e.LoadErr(), ErrSnapshotCorrupt) {
+		t.Fatalf("want ErrSnapshotCorrupt, got %v", e.LoadErr())
 	}
-	if st := e.Stats(); st.Domains != 2 || st.Representations != 50 {
-		t.Fatalf("stats %+v", st)
-	}
-	// Version 2 records have no BaseSize: they load, but as incomplete hints.
-	got, ok := e.Domain(key(1)).LookupRep(key(100))
-	if !ok || got.Complete() || got.DeltaObjectKey != key(1) || got.ObjectSize != 1000 {
-		t.Fatalf("legacy rep: ok=%v %+v", ok, got)
-	}
-	e.dirty.Store(true)
-	if err := e.Snapshot(); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := os.ReadFile(path)
-	if binary.LittleEndian.Uint32(raw[len(snapMagic):]) != snapVersion {
-		t.Fatal("the rewritten snapshot must be the sealed version")
+	if e.Stats().Domains != 0 || e.Stats().Representations != 0 {
+		t.Fatalf("a snapshot of another version must not load: %+v", e.Stats())
 	}
 }
 

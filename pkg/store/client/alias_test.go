@@ -64,6 +64,40 @@ func TestPutRepresentingAndResolve(t *testing.T) {
 	}
 }
 
+// Checks the sequence Bundle upload uses for a delta object: a plain Put, then
+// PutRepresenting of the same object. The second call records the alias even
+// though the object already exists, and an alias conflict never deletes the
+// object, because this request did not create it.
+func TestPutRepresentingAfterPutRecordsAliasWithoutDiscard(t *testing.T) {
+	c := startBufconnPair(t, 1, true)
+	ctx := context.Background()
+	adm := testAdmission(t, c)
+
+	obj, h := []byte("bundled patch"), key([]byte("chunk"))
+	if _, err := c.Put(ctx, adm, store.PartitionChunk, key(obj), obj); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.PutRepresenting(ctx, adm, key(obj), obj, h)
+	if err != nil || res.IsNew || res.Represented != store.RepresentedWon || res.Discarded {
+		t.Fatalf("representing Put of a stored object = %+v, %v", res, err)
+	}
+	if r, err := c.Resolve(ctx, adm.Generation, h); err != nil || r.Resolution != store.ResolutionDelta || r.DeltaKey != key(obj) {
+		t.Fatalf("resolve = %+v, %v", r, err)
+	}
+
+	other := []byte("another bundled patch")
+	if _, err := c.Put(ctx, adm, store.PartitionChunk, key(other), other); err != nil {
+		t.Fatal(err)
+	}
+	res, err = c.PutRepresenting(ctx, adm, key(other), other, h)
+	if err != nil || res.Represented != store.RepresentedLost || res.Key != key(obj) || res.Discarded {
+		t.Fatalf("conflicting representing Put = %+v, %v", res, err)
+	}
+	if found, _, err := c.Get(ctx, store.PartitionChunk, key(other)); !found || err != nil {
+		t.Fatalf("an object this request did not create was deleted: %v, %v", found, err)
+	}
+}
+
 // Checks that Resolve rejects a stale generation with FailedPrecondition rather
 // than ErrUnsupported, preserving the distinction between an outdated client
 // token and a server that lacks alias support.

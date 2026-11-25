@@ -128,7 +128,7 @@ For every unique chunk the ingester still computes the independent object: its h
    - `LOST{k}`: another writer's delta already represents the chunk. The Store has **deleted our object** (`discarded`) if this `Put` created it. Adopt `k`; if adoption fails definitively, store independently (which supersedes the alias for everyone).
    - `NONE` (the alias step failed): our object is valid but unnamed, and an unnamed delta must not be referenced. Store independently; the unnamed object is an orphan for `delta-gc`.
 
-**Adoption** is mandatory and complete. A node adopting another node's delta reads the object, checks its hash, header and the acceptance rule, re-derives `K_d` from its own plaintext and opens it, reads the base, re-encrypts the base under its own salt to prove `K_base` matches the base's address, applies the patch and compares every byte. Only then does it record the representation and write `K_d` into its manifest. A definitive failure stores the chunk independently; a transient one (read error, context cancelled) keeps the node's own delta if it has one.
+**Adoption** is mandatory and complete. A node adopting another node's delta reads the object, checks its hash, header and the acceptance rule, re-derives `K_d` from its own plaintext and opens it, takes the base from its pool or reads it, checks its size against the header and re-encrypts it under its own salt to prove `K_base` matches the base's address, applies the patch and compares every byte. Only then does it record the representation and write `K_d` into its manifest. A definitive failure stores the chunk independently; a transient one (read error, context cancelled) keeps the node's own delta if it has one.
 
 The chunk whose delta was accepted is **not** registered as a base (depth one). The chunk is sketched regardless of the outcome, because the sketch is how it becomes a base for later chunks.
 
@@ -154,7 +154,7 @@ K_snap = HMAC-SHA256(customerKey, "accelerator-delta-snapshot/v1")
 K_file = HMAC-SHA256(K_snap, "accelerator-delta-snapshot-file/v1" ‖ fileID)   # fileID: 16 random bytes in the header
 ```
 
-The body is a sequence of independently sealed 1 MiB frames with the frame counter in the nonce and the header plus an end-of-file flag in the AAD, so truncation and reordering are detected without a separate checksum. A snapshot written under another customer key, another generation or other sketch parameters is refused and the engine starts empty (one log line). Version 1 and 2 snapshots, written before sealing existed, still load but their representation entries lack the base size and are forgotten on first use.
+The body is a sequence of independently sealed 1 MiB frames with the frame counter in the nonce and the header plus an end-of-file flag in the AAD, so truncation and reordering are detected without a separate checksum. A snapshot written under another customer key, another generation or other sketch parameters is refused and the engine starts empty (one log line).
 
 ## Read path
 
@@ -162,7 +162,9 @@ Readers need no configuration to read delta chunks: `fetch.*` sizes the buffers,
 
 Decoded bases live in a **shared plaintext base cache** (`fetch.base_cache_bytes`) keyed on **object address, base key and plaintext size**. Keying on the address alone would let a manifest carrying a wrong key for a base poison every other reader of that base in the process; with the key in the cache key a bad manifest only fails its own read.
 
-**Prefetch** of a Version 2 manifest warms deltas and their bases in parallel through the delta table; a Version 1 manifest (or an old reader) warms the delta first and discovers the base when it opens it.
+Before applying, the reader checks the object against the manifest: the entry's delta flag must match the object's format byte, and the delta table must name the same base object and base size as the object header. The flag and table are authenticated by the key table's AAD and the header is not, so this binds the base to the manifest even with `verify_content` off. A mismatch fails the read before the base is fetched.
+
+**Prefetch** of a Version 2 manifest warms deltas and their bases in parallel through the delta table.
 
 A delta chunk costs more than an independent one: one extra object fetch when the base is not cached, one decrypt of the base and one VCDIFF apply either way.
 
@@ -195,20 +197,29 @@ A **generation purge** removes chunk, manifest, blob and alias partitions togeth
 
 ## Bundles
 
-A bundle **can carry** delta chunks: `FullVerify` and the multi-upload verifier open each delta, require its base to be present in the bundle (`ErrIncomplete` otherwise), check the manifest's delta table against the object header, reject a base that is itself a delta, and apply and compare. `CopyManifest` copies the full closure including bases. Bundle **writers do not produce** deltas: the base would have to be carried in full, which is what the delta was meant to avoid, so a writer in bundle mode runs with delta off and logs it once. A delta-encoded image can still be bundled by a tool that copies an existing manifest's closure.
+A bundle **can carry** delta chunks: `FullVerify` and the multi-upload verifier open each delta, require its base to be present in the bundle (`ErrIncomplete` otherwise), check the manifest's delta table against the object header, reject a base that is itself a delta, and apply and compare. `CopyManifest` copies the full closure including bases.
+
+Uploading a bundle that carries delta chunks (`Reader.Upload`, `UploadExactManifests`) stores each delta object and then records the alias that names it, under the chunk's independent address in the target's admission generation. That way `store-ctl delta-gc` does not treat it as an orphan. When the alias cannot be recorded, the upload fails with `bundle.ErrDeltaAlias` before any manifest is published. The causes are:
+
+- the target client cannot record aliases;
+- the store does not report a recorded alias (a server that predates aliases);
+- the target already represents the chunk by a different delta object;
+- the manifest was written with a writer extra salt, so the chunk's independent address cannot be computed from the generation salt.
+
+Any delta object stored before the failure is unreferenced, and `delta-gc` removes it after its grace period.
+
+Bundle **writers do not produce** deltas: the base would have to be carried in full, which is what the delta was meant to avoid, so a writer in bundle mode runs with delta off and logs it once. A delta-encoded image can still be bundled by a tool that copies an existing manifest's closure.
 
 ## Compatibility and rollout
 
 - **Readers first.** A reader that predates the feature fails on `0x03` with "unknown chunk format" and on a Version 2 manifest with an unknown-version error. Upgrade every binary that opens chunks or manifests, then `store-ctl`, then enable `delta.enabled` on writers. All current readers accept `0x03` and Version 2 whether or not delta is enabled for them.
 - **Old `store-ctl`.** A Store without `Resolve` makes the writer store independently for the rest of the process (one log line). Deployments with several Stores get delta only on upgraded ones, and manifests for the same image can differ between Stores, as they already can.
 - **Determinism.** A first-ever ingest with delta on is byte-identical to the delta-off manifest when nothing in the image has a base; re-ingesting an image reproduces the same manifest key, in the same process, after a restart with the snapshot, and on a cold node (through the alias). What delta changes is that two *empty* Stores given the same images in different orders can pick different bases and so produce different manifest keys.
-- **Version 1 manifests that reference deltas** exist from before the manifest change. Readers detect the delta by the object's format byte, so they stay readable; only prefetch and `deps` learn nothing about their bases.
-- **Snapshot files** from before sealing (versions 1 and 2) still load.
 - `go.mod` is unchanged: the VCDIFF codec is vendored under `pkg/manifest/delta/internal/vcdiff` with a bounded decoder (see `NOTICE.md`).
 
 ## Testing
 
-- Unit and integration tests under `pkg/manifest/delta`, `pkg/manifest/crypto`, `pkg/manifest/codec` (Version 2 round trip, Version 1 bytes and AAD unchanged, inconsistent tables rejected), `pkg/manifest/ingest` (every delta image read back through the manifest and the Store as a reader would, concurrent nodes converging on one manifest, adoption failures, discard accounting), `pkg/manifest/fetch` (delta materialisation, base-cache poisoning, prefetch warming bases), `pkg/manifest/bundle` (delta verification, tampering, missing bases, closure copy), `pkg/store` (aliases, discard, `AuditDeltas` on fs and S3) and `cmd/store-ctl`/`cmd/manifest-ctl`.
+- Unit and integration tests under `pkg/manifest/delta`, `pkg/manifest/crypto`, `pkg/manifest/codec` (Version 2 round trip, Version 1 bytes and AAD unchanged, inconsistent tables rejected), `pkg/manifest/ingest` (every delta image read back through the manifest and the Store as a reader would, concurrent nodes converging on one manifest, adoption failures, discard accounting), `pkg/manifest/fetch` (delta materialisation, base-cache poisoning, prefetch warming bases), `pkg/manifest/bundle` (delta verification, tampering, missing bases, closure copy, alias recording on upload and its failure cases), `pkg/store` (aliases, discard, `AuditDeltas` on fs and S3) and `cmd/store-ctl`/`cmd/manifest-ctl`.
 - Fuzzing: `FuzzEncodeApply` and `FuzzApplyUntrusted` on the VCDIFF codec.
 - Product E2E: `test/e2e/cases/image.manifest-delta.sh` runs two Store sidecars and delta-on/off writers over real binaries, asserts the write-side and read-side contracts above, checks `delta-gc` finds no orphans after ingest, verifies the sealed snapshot is reloaded by a new process and does not contain a base key in the clear, and reports the full-load start-up time of a delta-encoded image on versus off. See [test/e2e/README.md](../test/e2e/README.md).
 
